@@ -22,6 +22,19 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
+# 全局字体设置：优先使用 macOS 常见中文字体，避免图表中文字显示为小方框
+plt.rcParams['font.sans-serif'] = [
+    'PingFang SC',        # macOS 系统中文默认字体
+    'Hiragino Sans GB',   # 较新的中文黑体
+    'Heiti TC',           # 旧版黑体
+    'Songti SC',          # 宋体系列
+    'STHeiti',            # 兼容早期系统
+    'SimHei',             # Windows 常见黑体
+    'Arial Unicode MS',   # 跨平台备用
+    'DejaVu Sans'         # 最后兜底
+]
+plt.rcParams['axes.unicode_minus'] = False
+
 # ===================== 全局配置 =====================
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
@@ -34,8 +47,13 @@ if CURRENT_ENV == "prod":
 else:
     from config.dev_config import DB_PATH
 
-# 目录配置
-MODEL_DIR = os.path.join(PROJECT_ROOT, "trained_models")
+# 目录配置（按环境区分模型目录；metrics / visualization 暂共用）
+if CURRENT_ENV == "prod":
+    MODEL_DIR = os.path.join(PROJECT_ROOT, "trained_models")
+else:
+    # 开发环境单独使用 developed_models 目录，避免和生产模型混在一起
+    MODEL_DIR = os.path.join(PROJECT_ROOT, "developed_models")
+
 METRICS_DIR = os.path.join(PROJECT_ROOT, "metrics")
 VIS_DIR = os.path.join(PROJECT_ROOT, "visualization")
 
@@ -1078,8 +1096,6 @@ def predict_today(target_date):
         use_container_width=True
     )
 
-    plt.rcParams['font.sans-serif'] = ['Heiti TC', 'SimHei', 'Arial Unicode MS']
-    plt.rcParams['axes.unicode_minus'] = False
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     fig.suptitle(f'预测分析报告（{target_date}）', fontsize=16, fontweight='bold', y=0.98)
 
@@ -1309,18 +1325,45 @@ def predict_today(target_date):
                         conn.close()
         st.markdown("---")
 
-    # 9. 模型历史表现
-    # ... (这部分代码没有问题，此处省略)
-    st.markdown("### 📈 模型历史表现")
-    stats = get_model_historical_stats(DB_PATH)
+    # 9. 模型历史表现（基于 Top2 记录）
+    st.markdown("### 📈 模型历史表现（Top2 命中率）")
+
+    total_rows = 0
+    labeled_rows = 0
+    hit_rows = 0
+
+    conn = get_db_connection(DB_PATH)
+    if conn:
+        try:
+            cursor = conn.cursor()
+            # 表总记录数
+            cursor.execute("SELECT COUNT(*) FROM model_pred_stats_top2")
+            row = cursor.fetchone()
+            total_rows = row[0] if row and row[0] is not None else 0
+
+            # is_hit 字段已填写的记录数（不为 NULL）
+            cursor.execute("SELECT COUNT(*) FROM model_pred_stats_top2 WHERE is_hit IS NOT NULL")
+            row = cursor.fetchone()
+            labeled_rows = row[0] if row and row[0] is not None else 0
+
+            # 命中记录数（is_hit = 1）
+            cursor.execute("SELECT COUNT(*) FROM model_pred_stats_top2 WHERE is_hit = 1")
+            row = cursor.fetchone()
+            hit_rows = row[0] if row and row[0] is not None else 0
+
+        except Exception as e:
+            st.warning(f"⚠️ 统计 Top2 命中率失败：{str(e)[:150]}")
+        finally:
+            conn.close()
+
     stat_cols = st.columns(3)
     with stat_cols[0]:
-        st.metric("累计预测次数", stats["total_predictions"], delta=0, help="模型历史所有预测记录总数")
+        st.metric("Top2 已结算次数", labeled_rows, delta=0, help="is_hit 字段不为 NULL 的记录数（已结算）")
     with stat_cols[1]:
-        st.metric("累计命中次数", stats["total_hits"], delta=0, help="预测结果与实际赛果一致的记录数")
+        st.metric("Top2 命中次数", hit_rows, delta=0, help="is_hit = 1 的记录数（命中次数）")
     with stat_cols[2]:
-        acc = stats["accuracy"] if stats["total_predictions"] > 0 else 0.0
-        st.metric("累计准确率", f"{acc:.1%}", delta=0, help="累计命中次数 / 累计预测次数")
+        acc = hit_rows / labeled_rows if labeled_rows > 0 else 0.0
+        st.metric("Top2 命中率（已结算）", f"{acc:.1%}", delta=0, help="命中次数 / 已结算次数（is_hit=1 / is_hit不为NULL）")
 
     # 10. 可选：自动入库Top2高置信预测
     # ... (这部分代码没有问题，此处省略)
@@ -1349,9 +1392,6 @@ def visualize_metrics(train_result, date_tag):
     lgb_top300_features = train_result.get('lgb_top300_features', [])
     lr_final_features = train_result.get('lr_final_features', [])
 
-    # 设置中文字体
-    plt.rcParams['font.sans-serif'] = ['Heiti TC', 'Arial Unicode MS', 'SimHei', 'DejaVu Sans']
-    plt.rcParams['axes.unicode_minus'] = False
 
     # 创建4x2子图
     fig, axes = plt.subplots(4, 2, figsize=(18, 22))
@@ -1558,12 +1598,15 @@ def main():
     # ---------------------- 功能1：全量训练 ----------------------
     if function_option == "全量训练":
         st.header("🚀 全量训练配置")
+        env_label = "生产环境" if CURRENT_ENV == "prod" else "开发环境"
+        st.caption(f"当前环境：{env_label}（FOOTBALL_ENV={CURRENT_ENV}）")
 
         col1, col2 = st.columns(2)
         with col1:
             start_date = st.date_input("训练起始日期", value=pd.to_datetime('2025-10-11'))
         with col2:
-            end_date = st.date_input("训练结束日期", value=pd.to_datetime('2025-10-11'))
+            default_end_date = (datetime.now() - timedelta(days=1)).date()
+            end_date = st.date_input("训练结束日期", value=default_end_date)
 
         st.markdown("---")
 
@@ -1601,6 +1644,8 @@ def main():
     # ---------------------- 功能2：当日推理 ----------------------
     elif function_option == "当日推理":
         st.header("🎯 当日推理配置")
+        env_label = "生产环境" if CURRENT_ENV == "prod" else "开发环境"
+        st.caption(f"当前环境：{env_label}（FOOTBALL_ENV={CURRENT_ENV}）")
 
         target_date = st.date_input("选择推理日期", value=pd.to_datetime(datetime.now().strftime('%Y-%m-%d')))
         target_date_str = target_date.strftime('%Y-%m-%d')

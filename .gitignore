@@ -1,0 +1,19 @@
+# Python & virtualenv
+__pycache__/
+*.py[cod]
+.venv/
+
+# IDE
+.idea/
+
+# Local databases
+*.db
+data/dev/
+data/prod/
+
+# Trained models & metrics
+trained_models/
+metrics/
+
+# Visualization outputs
+visualization/*.png

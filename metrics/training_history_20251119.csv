@@ -1,2 +1,0 @@
-﻿window_start,window_end,sample_count,valid_predictors_count,lr_f1,lgb_f1,lr_cv_var,lgb_cv_var,best_model,is_new_best
-2025-10-11,2025-11-14,4673,187,0.549,0.622,0.015,0.061,LightGBM,0

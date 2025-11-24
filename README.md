@@ -31,3 +31,32 @@ FootballRecommend/
 │   └── data_input_integrated.py    # 信息录入入口（Streamlit App：竞彩比赛、预测、赛果录入）
 ├── requirements.txt
 └── README.md
+```
+
+---
+
+## 🚀 怎么运行这个项目
+
+本项目通过环境变量 `FOOTBALL_ENV` 来区分 **开发环境（dev）** 和 **生产环境（prod）**：
+
+- `FOOTBALL_ENV=dev`：使用开发库 \
+  - 读写 `data/dev/football_dev.db`\
+  - 使用 `config/dev_config.py` 中的配置
+- `FOOTBALL_ENV=prod`：使用生产库 \
+  - 读写 `data/prod/football_prod.db`\
+  - 使用 `config/prod_config.py` 中的配置
+
+### 💡 用脚本一键启动
+
+```bash
+scripts/run_dev_input.sh   # 开发环境录入
+```
+```bash
+scripts/run_dev_train.sh   # 开发环境训练/推理
+```
+```bash
+scripts/run_prod_input.sh  # 生产环境录入
+```
+```bash
+scripts/run_prod_train.sh  # 生产环境训练/推理
+```
