@@ -13,6 +13,7 @@ data/prod/
 
 # Trained models & metrics
 trained_models/
+developed_models/
 metrics/
 
 # Visualization outputs
