@@ -247,7 +247,8 @@ def hebo_lgb_tune(train_data, show_curve=True):
             'objective': 'binary',
             'metric': 'binary_logloss',
             'verbose': -1,
-            'seed': 42
+            'seed': 42,
+            'feature_pre_filter': False
         })
         cv_results = lgb.cv(
             params,
@@ -259,7 +260,8 @@ def hebo_lgb_tune(train_data, show_curve=True):
 
         target_key = 'valid binary_logloss-mean'
         if target_key in cv_results and len(cv_results[target_key]) > 0:
-            return cv_results[target_key][-1]
+            vals = cv_results[target_key]
+            return float(np.min(vals))
         else:
             return 1e9
 
@@ -293,34 +295,36 @@ def hebo_lgb_tune(train_data, show_curve=True):
         'bagging_seed': 42,
     })
 
-    # 使用最佳参数重新做一遍CV，记录logloss随迭代轮数的变化
-    if show_curve:
-        logloss_curve = None
-        try:
-            cv_results = lgb.cv(
-                best_params,
-                train_data,
-                num_boost_round=200,
-                nfold=3,
-                stratified=True,
-            )
-            target_key = 'valid binary_logloss-mean'
-            if target_key in cv_results and len(cv_results[target_key]) > 0:
-                logloss_curve = cv_results[target_key]
-        except Exception as e:
-            logger.warning(f"LightGBM CV绘制logloss曲线失败: {e}")
+    # 使用最佳参数重新做一遍CV，记录logloss随迭代轮数的变化，并找到最优 boosting 轮数
+    logloss_curve = None
+    best_boost_round = 200  # 默认为 200 轮，若CV成功则用最优轮数覆盖
+    try:
+        cv_results = lgb.cv(
+            best_params,
+            train_data,
+            num_boost_round=200,
+            nfold=3,
+            stratified=True,
+        )
+        target_key = 'valid binary_logloss-mean'
+        if target_key in cv_results and len(cv_results[target_key]) > 0:
+            logloss_curve = cv_results[target_key]
+            # 方案A：使用整个曲线中的最小 logloss 对应的轮数作为最优 boosting 轮数
+            best_boost_round = int(np.argmin(logloss_curve)) + 1
+    except Exception as e:
+        logger.warning(f"LightGBM CV绘制logloss曲线失败: {e}")
 
-        if logloss_curve is not None:
-            st.markdown("### 📉 LightGBM CV Logloss 收敛曲线（最佳参数）")
-            fig, ax = plt.subplots(figsize=(8, 4))
-            ax.plot(range(1, len(logloss_curve) + 1), logloss_curve, marker='o', linewidth=1)
-            ax.set_xlabel('迭代轮数（num_boost_round）', fontsize=12)
-            ax.set_ylabel('验证集 logloss', fontsize=12)
-            ax.set_title('CV Logloss vs Boosting Round', fontsize=14, fontweight='bold')
-            ax.grid(alpha=0.3)
-            st.pyplot(fig)
+    if show_curve and logloss_curve is not None:
+        st.markdown("### 📉 LightGBM CV Logloss 收敛曲线（最佳参数）")
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.plot(range(1, len(logloss_curve) + 1), logloss_curve, marker='o', linewidth=1)
+        ax.set_xlabel('迭代轮数（num_boost_round）', fontsize=12)
+        ax.set_ylabel('验证集 logloss', fontsize=12)
+        ax.set_title('CV Logloss vs Boosting Round', fontsize=14, fontweight='bold')
+        ax.grid(alpha=0.3)
+        st.pyplot(fig)
 
-    return best_params
+    return best_params, best_boost_round
 
 def train_base_models(X, y, current_predictor_ids, prediction_type):
     """训练流程：支持新增预测者，保存预测者ID和特征模板"""
@@ -334,10 +338,10 @@ def train_base_models(X, y, current_predictor_ids, prediction_type):
     # ---------------------- 步骤1-4：原训练逻辑保留，新增特征筛选时考虑所有预测者 ----------------------
     sample_weight = np.array([2 if lbl == 1 else 1 for lbl in y_train])
     train_data = lgb.Dataset(X_train, label=y_train, weight=sample_weight)
-    best_lgb_params = hebo_lgb_tune(train_data, show_curve=True)
+    best_lgb_params, best_boost_round = hebo_lgb_tune(train_data, show_curve=True)
 
     # 临时模型获取特征重要性
-    lgb_clf_temp = LGBMClassifier(**best_lgb_params, random_state=42)
+    lgb_clf_temp = LGBMClassifier(**best_lgb_params, n_estimators=best_boost_round, random_state=42)
     lgb_clf_temp.fit(X_train, y_train, sample_weight=sample_weight, eval_set=[(X_test, y_test)], eval_metric='binary_logloss')
 
     # 提取特征重要性（覆盖所有预测者的特征），仅用于后续可视化和分析
@@ -360,7 +364,7 @@ def train_base_models(X, y, current_predictor_ids, prediction_type):
     X_train_lgb = X_train[all_lgb_features].copy()
     X_test_lgb = X_test[all_lgb_features].copy()
 
-    lgb_clf_final = LGBMClassifier(**best_lgb_params, random_state=42)
+    lgb_clf_final = LGBMClassifier(**best_lgb_params, n_estimators=best_boost_round, random_state=42)
     lgb_clf_final.fit(
         X_train_lgb,
         y_train,
@@ -411,7 +415,7 @@ def train_base_models(X, y, current_predictor_ids, prediction_type):
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     def safe_f1_score(y_true, y_pred): return f1_score(y_true, y_pred) if len(np.unique(y_true)) > 1 else 0.0
     lgb_cv_scores = cross_val_score(
-        LGBMClassifier(**best_lgb_params, random_state=42),
+        LGBMClassifier(**best_lgb_params, n_estimators=best_boost_round, random_state=42),
         X[all_lgb_features],
         y,
         cv=skf,
