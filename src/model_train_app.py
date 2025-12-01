@@ -19,6 +19,8 @@ import lightgbm as lgb
 from hebo.design_space.design_space import DesignSpace
 from hebo.optimizers.hebo import HEBO
 import warnings
+from pymoo.config import Config
+Config.warnings['not_compiled'] = False
 
 warnings.filterwarnings('ignore')
 
@@ -815,16 +817,49 @@ def train_global_model(start_date, end_date):
     new_lr_f1 = train_result['metrics']['lr_metrics']['f1']
     historical_best_lgb = best_config["lgb_f1"]
 
-    # 新策略：更倾向于“用新的覆盖旧的”
+    # 新策略：考虑“性能 + 时效性”的双重约束
     # 规则：
     #   - 如果还没有历史最优模型（historical_best_lgb <= 0），任何新模型都视为最优；
-    #   - 否则，只要新模型的 F1 没有比历史最优差太多（例如最多低 0.001），就让新模型覆盖旧的。
-    #     这样可以保证新模型至少“不明显更差”，同时让最新模型尽量成为线上默认模型。
-    margin = 0.001  # 允许新模型比历史最优略低的容忍度
+    #   - 否则：
+    #       1）只要新模型的 F1 没有比历史最优差太多（<= base_margin），就允许用新模型覆盖旧模型；
+    #       2）如果新模型明显更差，则检查历史最优模型是否“过旧”（超过 force_refresh_days），
+    #          若过旧则为了时效性强制刷新为新模型。
+    base_margin = 0.005        # 允许新模型比历史最优略低的性能容忍度
+    force_refresh_days = 10    # 历史最优模型允许“不过期”的天数阈值
+
+    # 默认假设本次不是新最优，并初始化 days_gap
+    is_new_best = False
+    days_gap = None
+
     if historical_best_lgb <= 0:
+        # 没有历史最优模型时，当前一定是最优
         is_new_best = True
+        days_gap = 0
     else:
-        is_new_best = (new_lgb_f1 >= historical_best_lgb - margin)
+        # 1）性能维度：新模型没有比历史最优差太多，允许覆盖
+        if new_lgb_f1 >= historical_best_lgb - base_margin:
+            is_new_best = True
+        else:
+            # 2）时效维度：历史最优模型是否已经“过旧”
+            old_end_str = best_config.get("window_end", "")
+            try:
+                old_end = datetime.strptime(old_end_str, "%Y-%m-%d").date()
+                if pd.isna(max_date):
+                    # 若当前训练数据最大日期异常，则视作极旧，触发刷新
+                    days_gap = 9999
+                else:
+                    days_gap = (max_date.date() - old_end).days
+            except Exception:
+                # window_end 缺失或解析失败时，视作极旧
+                days_gap = 9999
+
+            if days_gap is not None and days_gap >= force_refresh_days:
+                is_new_best = True
+                logger.info(
+                    f"历史最优模型已过期 {days_gap} 天，"
+                    f"即使新模型 F1 略低 (new={new_lgb_f1:.3f}, best={historical_best_lgb:.3f})，"
+                    f"仍强制将当前模型设为新的最优模型"
+                )
 
     date_tag = max_date.strftime("%Y%m%d") if not pd.isna(max_date) else end_date.replace('-', '')
 
@@ -848,7 +883,7 @@ def train_global_model(start_date, end_date):
         if historical_best_lgb > 0:
             st.success(
                 f"🎉 新模型被设为最优模型！LightGBM F1 从 {historical_best_lgb:.3f} "
-                f"更新为 {new_lgb_f1:.3f}（允许下降阈值 {margin:.3f}）"
+                f"更新为 {new_lgb_f1:.3f}（允许下降阈值 {base_margin:.3f}）"
             )
         else:
             st.success(
@@ -856,10 +891,14 @@ def train_global_model(start_date, end_date):
             )
     else:
         delta = new_lgb_f1 - historical_best_lgb
+        extra_msg = ""
+        # 当 days_gap 被正确计算时，补充展示“距离历史最优窗口已过去多少天”
+        if days_gap is not None:
+            extra_msg = f"，当前训练数据结束日期距离历史最优模型窗口结束已过去 {days_gap} 天"
         st.info(
             f"ℹ️ 新模型暂未替换历史最优（当前 LightGBM F1: {new_lgb_f1:.3f}，"
             f"历史最优: {historical_best_lgb:.3f}，差值 {delta:+.3f}，"
-            f"允许下降阈值 {margin:.3f}）"
+            f"允许下降阈值 {base_margin:.3f}{extra_msg}）"
         )
 
     # 每次训练都生成可视化评估报告（全量视角）
