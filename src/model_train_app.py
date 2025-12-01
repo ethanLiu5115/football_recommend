@@ -404,6 +404,11 @@ def train_base_models(X, y, current_predictor_ids, prediction_type):
     lr_metrics = calculate_base_metrics(y_test, lr_pred)
     lgb_metrics = calculate_base_metrics(y_test, lgb_pred)
 
+    # 概率输出：用于后续 logloss / bucket 分析 & LGB vs Ensemble 对比
+    lr_proba = lr_model.predict_proba(X_test_lr_scaled)[:, 1]
+    lgb_proba = lgb_clf_final.predict_proba(X_test_lgb)[:, 1]
+    ensemble_proba = (lgb_proba + lr_proba) / 2
+
     # 计算稳定性指标（增加NaN检查）
     def get_stability_metrics(scores):
         scores = scores[~np.isnan(scores)]  # 去除NaN值
@@ -444,7 +449,11 @@ def train_base_models(X, y, current_predictor_ids, prediction_type):
     return {
         'lr_model': lr_model, 'lgb_model': lgb_clf_final, 'scaler': scaler,
         'metrics': metrics, 'X_test': X_test, 'y_test': y_test,
-        'lr_pred': lr_pred, 'lgb_pred': lgb_pred, 'lgb_proba': lgb_clf_final.predict_proba(X_test_lgb)[:, 1],
+        'lr_pred': lr_pred,
+        'lgb_pred': lgb_pred,
+        'lgb_proba': lgb_proba,
+        'lr_proba': lr_proba,
+        'ensemble_proba': ensemble_proba,
         'lgb_top300_features': all_lgb_features, 'lr_final_features': final_lr_features,
         'model_date': model_date, 'model_predictors': current_predictor_ids, 'prediction_type': prediction_type
     }
@@ -737,7 +746,7 @@ def train_global_model(start_date, end_date):
             st.pyplot(fig)
 
             st.markdown("#### 📊 各时间窗口基础表现概览")
-            st.dataframe(logs_df.round(3), use_container_width=True)
+            st.dataframe(logs_df.round(3), width='stretch')
 
             # 持久化窗口级日志
             logs_save_path = os.path.join(
@@ -754,7 +763,7 @@ def train_global_model(start_date, end_date):
             bucket_df_display['hit_rate'] = bucket_df_display['hit_rate'].apply(_fmt_hit_rate)
 
             st.markdown("#### 🎯 各时间窗口高置信度 bucket 真实命中率")
-            st.dataframe(bucket_df_display, use_container_width=True)
+            st.dataframe(bucket_df_display, width='stretch')
 
         if len(human_imp_list) > 0:
             st.markdown("#### 🧍 各时间窗口“人维度”特征重要性（Top15，仅特征名前缀 pred_）")
@@ -961,7 +970,6 @@ def predict_today(target_date):
 
     # 4. 多模型推理
     model_preds = []
-    model_confidence_list = []
 
     # <--- 关键修改 1: 在循环前初始化变量为 None
     lgb_model = None
@@ -1001,8 +1009,8 @@ def predict_today(target_date):
             st.write(f"LGB 模型概率 (前10个): {lgb_proba[:10]}")
             # <--- 调试代码结束
 
-            model_confidence = (lr_proba + lgb_proba) / 2
-            model_confidence_list.append(model_confidence)
+            # 线上置信度：当前版本改为纯 LightGBM 概率
+            model_confidence = lgb_proba
 
             model_preds.append(pd.DataFrame({
                 'predictor_id': pred_df['predictor_id'].values,
@@ -1043,7 +1051,6 @@ def predict_today(target_date):
         )
     confidence_cols = [col for col in merged_pred.columns if col.startswith('confidence_model_')]
     merged_pred['confidence'] = merged_pred[confidence_cols].mean(axis=1).round(3)
-    merged_pred['model_consensus'] = merged_pred[confidence_cols].std(axis=1).round(3)
 
     # 针对“总进球数”玩法的组合投注做一层置信度惩罚，避免 2/3球、3/4球 等与超宽区间组合拿到类似置信度
     merged_pred = adjust_goal_combo_confidence(merged_pred)
@@ -1081,23 +1088,21 @@ def predict_today(target_date):
 
     # 填默认值
     match_best_all = match_best_all.fillna({
-        'handicap_value': '无',
-        'model_consensus': 0.5
+        'handicap_value': '无'
     })
     match_best_pred = match_best_pred.fillna({
-        'handicap_value': '无',
-        'model_consensus': 0.5
+        'handicap_value': '无'
     })
 
     # 7. 新增：预测可解释性可视化
     st.markdown("### 📋 全部比赛最终预测（每场每玩法取置信度最高的方案）")
 
-    all_display_cols = ['display_date', 'match_no', 'prediction_type', 'original_term', 'confidence', 'model_consensus']
+    all_display_cols = ['display_date', 'match_no', 'prediction_type', 'original_term', 'confidence']
     existing_cols = [c for c in all_display_cols if c in match_best_all.columns]
 
     st.dataframe(
         match_best_all[existing_cols].sort_values('confidence', ascending=False).reset_index(drop=True),
-        use_container_width=True
+        width='stretch'
     )
 
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
@@ -1127,23 +1132,21 @@ def predict_today(target_date):
     axes[0, 1].set_title('Top10预测置信度分布', fontweight='bold')
     axes[0, 1].grid(axis='y', alpha=0.3)
 
-    # 7.3 置信度 vs 模型共识度
-    scatter = axes[1, 0].scatter(
+    # 7.3 Top10 置信度走势（当前版本仅使用单模型，不再展示模型共识度）
+    axes[1, 0].plot(
+        range(1, len(match_best_pred) + 1),
         match_best_pred['confidence'],
-        match_best_pred['model_consensus'],
-        c=match_best_pred['confidence'],
-        cmap='RdYlGn_r',
-        s=80,
-        edgecolor='black',
+        marker='o',
+        linestyle='-',
+        linewidth=2,
         alpha=0.8
     )
-    axes[1, 0].set_xlabel('置信度', fontsize=12)
-    axes[1, 0].set_ylabel('模型共识度（标准差，越小越好）', fontsize=12)
-    axes[1, 0].set_title('置信度 vs 模型共识度', fontweight='bold')
-    axes[1, 0].axhline(y=0.1, color='red', linestyle='--', alpha=0.7, label='低波动阈值（0.1）')
+    axes[1, 0].set_xlabel('Top 排名（1 = 最高置信度）', fontsize=12)
+    axes[1, 0].set_ylabel('置信度', fontsize=12)
+    axes[1, 0].set_title('Top10 置信度走势', fontweight='bold')
+    axes[1, 0].axhline(y=0.8, color='green', linestyle='--', alpha=0.7, label='高置信阈值（0.8）')
     axes[1, 0].legend()
     axes[1, 0].grid(alpha=0.3)
-    plt.colorbar(scatter, ax=axes[1, 0], label='置信度')
 
     # <--- 关键修改 3: 在使用 lgb_model 和 lgb_features 之前，先检查它们是否为 None
     if lgb_model is not None and lgb_features is not None and X_aligned_for_viz is not None:
@@ -1268,7 +1271,7 @@ def predict_today(target_date):
             return 'background-color: #f8d7da; color: #721c24; font-weight: bold'
 
     for idx, (_, row) in enumerate(match_best_pred.iterrows()):
-        cols = st.columns([1.2, 1, 2, 2, 1.2, 1.5, 1.3])
+        cols = st.columns([1.2, 1, 2, 2, 1.4])
         with cols[0]:
             st.write(f"📅 {row['display_date']}")
         with cols[1]:
@@ -1282,51 +1285,6 @@ def predict_today(target_date):
                 f"<div style='{get_confidence_style(row['confidence'])}; padding: 4px; border-radius: 4px'>{row['confidence']:.3f}</div>",
                 unsafe_allow_html=True
             )
-        with cols[5]:
-            consensus_level = "高" if row['model_consensus'] < 0.1 else "中" if row['model_consensus'] < 0.2 else "低"
-            st.write(f"共识：{consensus_level}（{row['model_consensus']:.3f}）")
-        with cols[6]:
-            if st.button(
-                    "加入记录",
-                    key=f"add_record_{idx}_{row['match_id']}_{row['original_term'][:5]}",
-                    help=f"将比赛#{row['match_id']}的预测加入model_prediction_records表"
-            ):
-                record_data = {
-                    'match_id': row['match_id'],
-                    'original_term': row['original_term'],
-                    'prediction_type': row['prediction_type'],
-                    'confidence': row['confidence'],
-                    'create_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'pred_date': row['betting_cycle_date']
-                }
-                conn = get_db_connection(DB_PATH)
-                if conn:
-                    try:
-                        exists = conn.execute("""
-                            SELECT 1 FROM model_prediction_records 
-                            WHERE match_id = ? AND original_term = ?
-                        """, (row['match_id'], row['original_term'])).fetchone()
-                        if exists:
-                            st.warning(f"⚠️ 比赛#{row['match_id']}（{row['original_term']}）已在推荐记录中，无需重复添加")
-                        else:
-                            conn.execute("""
-                                INSERT INTO model_prediction_records 
-                                (match_id, original_term, prediction_type, confidence, create_time, pred_date)
-                                VALUES (?, ?, ?, ?, ?, ?)
-                            """, (
-                                record_data['match_id'],
-                                record_data['original_term'],
-                                record_data['prediction_type'],
-                                record_data['confidence'],
-                                record_data['create_time'],
-                                record_data['pred_date']
-                            ))
-                            conn.commit()
-                            st.success(f"✅ 成功加入记录：比赛#{row['match_id']}（{row['original_term']}）")
-                    except Exception as e:
-                        st.error(f"❌ 加入记录失败：{str(e)[:100]}")
-                    finally:
-                        conn.close()
         st.markdown("---")
 
     # 9. 模型历史表现（基于 Top2 记录）
@@ -1392,6 +1350,8 @@ def visualize_metrics(train_result, date_tag):
     lr_pred = train_result['lr_pred']
     lgb_pred = train_result['lgb_pred']
     lgb_proba = train_result['lgb_proba']
+    lr_proba = train_result.get('lr_proba', None)
+    ensemble_proba = train_result.get('ensemble_proba', None)
     feature_cols = train_result['metrics']['feature_cols']
     lgb_top300_features = train_result.get('lgb_top300_features', [])
     lr_final_features = train_result.get('lr_final_features', [])
@@ -1449,6 +1409,34 @@ def visualize_metrics(train_result, date_tag):
         axes[1, 0].text(bar.get_x() + bar.get_width() / 2., height + 0.001,
                         f'方差：{var:.3f}\n均值F1：{mean:.3f}', ha='center', fontsize=10)
 
+    # ---------------------- 3.1 概率层面的 logloss 对比（LGB vs Ensemble） ----------------------
+    logloss_rows = []
+
+    try:
+        lgb_logloss = log_loss(y_test, lgb_proba)
+        logloss_rows.append({'模型': 'LightGBM', 'logloss': lgb_logloss})
+    except Exception:
+        lgb_logloss = None
+
+    if ensemble_proba is not None:
+        try:
+            ens_logloss = log_loss(y_test, ensemble_proba)
+            logloss_rows.append({'模型': 'Ensemble(LGB+LR)/2', 'logloss': ens_logloss})
+        except Exception:
+            pass
+
+    if lr_proba is not None:
+        try:
+            lr_logloss = log_loss(y_test, lr_proba)
+            logloss_rows.append({'模型': 'Logistic Regression', 'logloss': lr_logloss})
+        except Exception:
+            pass
+
+    if len(logloss_rows) > 0:
+        logloss_df = pd.DataFrame(logloss_rows)
+        st.markdown("#### 📉 概率层面的 logloss 对比（验证集）")
+        st.dataframe(logloss_df.round(4), width='stretch')
+
     # ---------------------- 4. 预测分布对比 ----------------------
     axes[1, 1].hist(lr_pred, bins=2, alpha=0.6, label='逻辑回归', color='#3498db', density=True, rwidth=0.7)
     axes[1, 1].hist(lgb_pred, bins=2, alpha=0.6, label='LightGBM', color='#e74c3c', density=True, rwidth=0.7)
@@ -1498,32 +1486,48 @@ def visualize_metrics(train_result, date_tag):
             arrowprops=dict(arrowstyle='->', color='red', lw=2)
         )
 
-    # ---------------------- 6.1 高置信度区间真实命中率统计 ----------------------
-    # 这里直接在验证集上统计不同阈值下的样本数和真实命中率，帮助判断“只押高置信度方案”的实战价值
+    # ---------------------- 6.1 高置信度区间真实命中率统计（LGB vs Ensemble） ----------------------
+    # 在验证集上统计不同阈值下的样本数和真实命中率，帮助判断“只押高置信度方案”的实战价值
     y_array = np.asarray(y_test)
     high_thresholds = [0.6, 0.7, 0.8, 0.9]
-    threshold_stats = []
-    for th in high_thresholds:
-        mask = lgb_proba >= th
-        selected = int(mask.sum())
-        if selected > 0:
-            hit_rate = float(y_array[mask].mean())
-        else:
-            hit_rate = np.nan
-        threshold_stats.append({
-            '阈值': th,
-            '样本数': selected,
-            '真实命中率': hit_rate if not np.isnan(hit_rate) else None
-        })
 
-    st.markdown("#### 🎯 高置信度区间真实命中率（LightGBM验证集）")
-    stats_df = pd.DataFrame(threshold_stats)
-    if not stats_df.empty:
+    def collect_bucket_stats(proba, name):
+        rows = []
+        for th in high_thresholds:
+            mask = proba >= th
+            selected = int(mask.sum())
+            if selected > 0:
+                hit_rate = float(y_array[mask].mean())
+            else:
+                hit_rate = np.nan
+            rows.append({
+                '模型': name,
+                '阈值': th,
+                '样本数': selected,
+                '真实命中率': hit_rate if not np.isnan(hit_rate) else None
+            })
+        return rows
+
+    all_rows = []
+    # LightGBM 必填
+    all_rows += collect_bucket_stats(lgb_proba, 'LightGBM')
+
+    # Ensemble 可选
+    if ensemble_proba is not None:
+        all_rows += collect_bucket_stats(ensemble_proba, 'Ensemble(LGB+LR)/2')
+
+    # LR 概率（更多是 sanity check）
+    if lr_proba is not None:
+        all_rows += collect_bucket_stats(lr_proba, 'Logistic Regression')
+
+    if len(all_rows) > 0:
+        stats_df = pd.DataFrame(all_rows)
         stats_df_display = stats_df.copy()
         stats_df_display['真实命中率'] = stats_df_display['真实命中率'].apply(
             lambda x: f"{x * 100:.1f}%" if x is not None else "无样本"
         )
-        st.dataframe(stats_df_display, use_container_width=True)
+        st.markdown("#### 🎯 高置信度区间真实命中率（验证集 LGB vs Ensemble 对比）")
+        st.dataframe(stats_df_display, width='stretch')
 
     # ---------------------- 7. 特征选择结果对比 ----------------------
     feature_count_data = pd.DataFrame({
@@ -1614,7 +1618,7 @@ def main():
 
         st.markdown("---")
 
-        if st.button("启动模型训练", type="primary", use_container_width=True):
+        if st.button("启动模型训练", type="primary", width='stretch'):
             if start_date > end_date:
                 st.error("❌ 起始日期不能晚于结束日期")
                 return
@@ -1629,7 +1633,7 @@ def main():
 
             if not train_history.empty:
                 st.markdown("### 📈 训练历史汇总")
-                st.dataframe(train_history.round(3), use_container_width=True)
+                st.dataframe(train_history.round(3), width='stretch')
 
                 # 训练趋势图（即使目前每次只有一行，也保留，方便后续扩展）
                 fig, ax = plt.subplots(figsize=(12, 6))
@@ -1656,7 +1660,7 @@ def main():
 
         st.markdown("---")
 
-        if st.button("执行当日推理", type="primary", use_container_width=True):
+        if st.button("执行当日推理", type="primary", width='stretch'):
             with st.spinner("🔍 正在执行推理..."):
                 match_best_pred, two_combos = predict_today(target_date_str)
 
